@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-synergy"
+version = "0.1.0"
+description = "Neural estimation of union information and synergy"
+authors = [{name = "Davide Nuzzi", email = "davidenuzzi@gmail.com"}]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.6.0",
+    "numpy>=2.2.5",
+    "tqdm",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "scipy",
+    "scikit-learn",
+    "mkdocs-material",
+]
