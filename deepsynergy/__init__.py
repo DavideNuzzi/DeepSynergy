@@ -2,38 +2,34 @@
 DeepSynergy
 ===========
 
-Neural framework for estimating *union information* and synergy.
+Neural framework for estimating *union information* and synergy
+via adversarial optimization under Blackwell constraints.
 
 Quick start
 -----------
 >>> import torch
->>> from deepsynergy import DeepSynergy, decoders
+>>> from deepsynergy import DeepSynergy, encoders, decoders
 >>>
->>> # --- encoder ---------------------------------------------------
->>> # mean & log-variance from Y  →  latent Z (Gaussian re-parameterisation)
->>> enc_core = torch.nn.Sequential(
-...     torch.nn.Linear(1, 8),          # toy hidden layer
-...     torch.nn.SELU(),
+>>> # --- encoder: maps Y → Z ---------------------------------------
+>>> encoder = encoders.GaussianEncoder(
+...     core=torch.nn.Sequential(torch.nn.Linear(1, 8), torch.nn.ReLU()),
+...     latent_dim=4
 ... )
->>> encoder = layers.GaussianLinear(8, 4)   # stochastic layer μ, σ → Z
->>> q_z_given_y = torch.nn.Sequential(enc_core, encoder)
 >>>
->>> # --- discriminator head q(Y | Z) --------------------------------
->>> disc_head = torch.nn.Sequential(torch.nn.Linear(4, 1))
->>> q_y_given_z = decoders.BinaryDecoder(disc_head)
+>>> # --- discriminator head q(Y | Z) -------------------------------
+>>> q_y_given_z = decoders.BinaryDecoder(torch.nn.Linear(4, 1))
 >>>
->>> # --- constraint head q(X | Z) -----------------------------------
->>> gen_head = torch.nn.Sequential(torch.nn.Linear(4, 1))
->>> q_x_given_z = decoders.BinaryDecoder(gen_head)
+>>> # --- constraint head q(X | Z) ----------------------------------
+>>> q_x_given_z = decoders.BinaryDecoder(torch.nn.Linear(4, 1))
 >>>
->>> model = DeepSynergy(q_z_given_y, q_y_given_z, q_x_given_z)
-# --------------------------------------------------------------------
+>>> # --- model -----------------------------------------------------
+>>> model = DeepSynergy(q_z_given_y=encoder, q_y_given_z=q_y_given_z, q_x_given_z=q_x_given_z)
 """
 
 from __future__ import annotations
 
 # ------------------------------------------------------------------ #
-# public API surface                                                 #
+# Public API surface                                                 #
 # ------------------------------------------------------------------ #
 from .model import DeepSynergy
 from .optim import build_optimizers
@@ -44,23 +40,22 @@ from .utils_training import (
     evaluate_deepsynergy_entropy,
     ParameterScheduler,
 )
-from . import decoders, encoders  # sub-modules re-exported for convenience
+from . import decoders, encoders
 
 __all__ = [
-    # core
+    # Core model
     "DeepSynergy",
-    # training utilities
+    # Training utilities
     "train_deepsynergy_model",
     "relax_deepsynergy_model",
     "train_decoder",
     "evaluate_deepsynergy_entropy",
     "ParameterScheduler",
-    # optimiser helper
+    # Optimizer utility
     "build_optimizers",
-    # sub-modules
+    # Modules
     "decoders",
     "encoders",
 ]
 
-# optional semantic version
-__version__ = "0.1.0"
+__version__ = "0.2.0"
