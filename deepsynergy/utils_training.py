@@ -76,13 +76,12 @@ def train_decoder(
     device: str = "cuda",
 ) -> Dict[str, np.ndarray]:
     """
-    Fit a single decoder **q(X | Z)** to minimise cross-entropy.
+    Fit a single decoder **q(X | Z)** to minimise cross-entropy.
 
     Returns a dict with:
-        * ``loss_history`` – array of shape (epochs, num_x_vars)
-        * ``loss``         – final per-variable vector (same units)
+        * ``loss_history`` - array of shape (epochs, num_x_vars)
+        * ``loss``         - final per-variable vector (same units)
     """
-    model.to(device).train()
     optimizer = optimizer or torch.optim.Adam(model.parameters(), lr=3e-4)
 
     loss_hist: list[np.ndarray] = []
@@ -113,7 +112,10 @@ def train_decoder(
         loss_hist.append(epoch_loss_vec)
 
         if show_progress:
-            loop.set_postfix({"loss": epoch_loss_vec})
+            if len(epoch_loss_vec) < 5:
+                loop.set_postfix({"loss": epoch_loss_vec})
+            else:
+                loop.set_postfix({"loss avg": epoch_loss_vec.mean()})
 
     return {
         "loss_history": np.stack(loss_hist, axis=0).astype(np.float32),
@@ -131,7 +133,6 @@ def train_deepsynergy_model(
     beta: Union[float, ParameterScheduler, Callable[[int], float]],
     alpha: float = 1.0,
     n_critic: int = 5,
-    num_z_samples: int = 50,
     epochs: int = 10_000,
     show_progress: bool = True,
     device: str = "cuda",
@@ -139,7 +140,6 @@ def train_deepsynergy_model(
     """
     Alternating-updates training loop (generator vs discriminator).
     """
-    model.to(device).train()
     beta_fn = beta if callable(beta) else (lambda _e, _b=beta: _b)
 
     loss_y_hist, loss_x_hist = [], []
@@ -156,9 +156,7 @@ def train_deepsynergy_model(
 
             # N critic steps
             for _ in range(n_critic):
-                disc_stats = model.discriminator_step(
-                    y_batch, num_z_samples=num_z_samples
-                )
+                disc_stats = model.discriminator_step(y_batch)
 
             epoch_loss_y += disc_stats["loss_y"]
 
@@ -166,8 +164,7 @@ def train_deepsynergy_model(
                 x_batch,
                 y_batch,
                 beta=beta_now,
-                alpha=alpha,
-                num_z_samples=num_z_samples,
+                alpha=alpha
             )
 
             epoch_loss_x += gen_stats["loss_constraint_x"]
@@ -178,13 +175,19 @@ def train_deepsynergy_model(
         loss_x_hist.append(epoch_loss_x)
 
         if show_progress:
-            loop.set_postfix(
-                {
-                    "beta": beta_now,
-                    "loss_y": epoch_loss_y,
-                    "loss_x": epoch_loss_x,
-                }
-            )
+            progress_dict = {'beta': beta_now}
+            
+            if len(epoch_loss_y) < 5:
+                progress_dict['loss_y'] = epoch_loss_y
+            else:
+                progress_dict['loss_y avg'] = epoch_loss_y.mean()
+
+            if len(epoch_loss_x) < 5:
+                progress_dict['loss_x'] = epoch_loss_x
+            else:
+                progress_dict['loss_x avg'] = epoch_loss_x.mean()
+
+            loop.set_postfix(progress_dict)
 
     return {
         "loss_y": epoch_loss_y,
@@ -201,7 +204,6 @@ def relax_deepsynergy_model(
     model: DeepSynergy,
     dataloader: DataLoader,
     *,
-    num_z_samples: int = 50,
     epochs: int = 1_500,
     show_progress: bool = True,
     device: str = "cuda",
@@ -209,7 +211,6 @@ def relax_deepsynergy_model(
     """
     Freeze generator; continue training the discriminator head only.
     """
-    model.to(device).eval()   # generator params frozen by not stepping them
     loss_y_hist = []
 
     loop = tqdm(range(epochs), disable=not show_progress)
@@ -217,14 +218,44 @@ def relax_deepsynergy_model(
         epoch_loss = 0.0
         for _x, y in dataloader:
             y = y.to(device)
-            stats = model.discriminator_step(y, num_z_samples=num_z_samples)
+            stats = model.discriminator_step(y)
             epoch_loss += stats["loss_y"]
 
         epoch_loss /= len(dataloader)
         loss_y_hist.append(epoch_loss)
 
         if show_progress:
-            loop.set_postfix({"loss_y": epoch_loss})
+            if len(epoch_loss) < 5:
+                loop.set_postfix({"loss_y": epoch_loss})
+            else:
+                loop.set_postfix({"loss_y avg": epoch_loss.mean()})
 
     return {"loss_y": epoch_loss,
             "loss_y_history": np.array(loss_y_hist, dtype=np.float32)}
+
+
+
+def evaluate_deepsynergy_entropy(
+    model: DeepSynergy,
+    dataloader: DataLoader,
+    device: str = "cuda",
+    ) -> Dict[str, np.ndarray]: 
+
+    entropy = 0
+    numel = 0
+    for x, y in dataloader:
+
+        batchsize = y.shape[0]
+        x = x.to(device)
+        y = y.to(device)
+        z, logprob_y, avg_logprob_x = model.forward(x, y)
+        loss_y = -logprob_y.detach().cpu().numpy()
+
+        entropy += loss_y * batchsize
+        numel += batchsize
+
+    entropy /= numel
+
+    return entropy
+
+

@@ -21,7 +21,7 @@ class DeepSynergy(nn.Module):
     """
     Parameters
     ----------
-    q_z_given_y : nn.Module
+    q_z_given_y : BaseEncoder
         Encoder  q(Z | Y).
     q_y_given_z : BaseDecoder
         Discriminator head  q(Y | Z).
@@ -39,45 +39,26 @@ class DeepSynergy(nn.Module):
         q_z_given_y: nn.Module,
         q_y_given_z: nn.Module,
         q_x_given_z: nn.Module,
+        num_z_samples: int = 10,
         *,
         optimizer: Union[str, type, Tuple] = "Adam",
         lr: Union[float, Tuple[float, float]] = 3e-4,
     ):
         super().__init__()
 
-        # networks ------------------------------------------------------ #
         self.q_z_given_y = q_z_given_y
         self.q_y_given_z = q_y_given_z
         self.q_x_given_z = q_x_given_z
+        self.num_z_samples = num_z_samples
 
-        # parameter groups --------------------------------------------- #
         self.gen_params: List[nn.Parameter] = (
             list(q_z_given_y.parameters()) + list(q_x_given_z.parameters())
         )
         self.disc_params: List[nn.Parameter] = list(q_y_given_z.parameters())
 
-        # constant buffer (ln 2) --------------------------------------- #
         self.register_buffer("_LOG2", torch.tensor(math.log(2.0)))
-
-        # fresh optimisers --------------------------------------------- #
+        self.register_buffer("_LOG2SAMPLES", torch.tensor(np.log2(self.num_z_samples)))
         self.reset_optimizers(optimizer=optimizer, lr=lr)
-
-    # ================================================================== #
-    #                            utilities                               #
-    # ================================================================== #
-    @staticmethod
-    def _tile_batch(t: Tensor, repeats: int) -> Tensor:
-        """Repeat the batch `repeats` times along dim-0."""
-        return t.repeat(repeats, *([1] * (t.dim() - 1)))
-
-    def _cross_entropy(self, logprob: Tensor, *, average_batch: bool = True) -> Tensor:
-        """
-        Cross-entropy (negative log-probability) in **bits**.
-
-        If `average_batch` is False the result keeps the batch dimension.
-        """
-        ce = -logprob
-        return ce.mean(dim=0) if average_batch else ce
 
     # ------------------------------------------------------------------ #
     def reset_optimizers(
@@ -103,8 +84,7 @@ class DeepSynergy(nn.Module):
         y: Tensor,
         *,
         beta: float = 1.0,     # λ_constraint
-        alpha: float = 1.0,    # λ_adv
-        num_z_samples: int = 1,
+        alpha: float = 1.0     # λ_adv
     ) -> Dict[str, Union[float, np.ndarray]]:
         """
         One update of the **generator** (encoder + constraint head).
@@ -118,103 +98,87 @@ class DeepSynergy(nn.Module):
         self.gen_opt.zero_grad()
 
         # ---- sample latent Z ----------------------------------------- #
-        y_tiled = self._tile_batch(y, num_z_samples)          # (num_z_samples·batch_size,…)
-        z = self.q_z_given_y(y_tiled)
-
+        z = self.q_z_given_y(y, num_samples=self.num_z_samples)   # (batch_size, num_z_samples, ...)
+        
         # ---- adversarial Y-loss -------------------------------------- #
         decoder_y_out = self.q_y_given_z(z)
-        logprob_y = self.q_y_given_z.log_prob(decoder_y_out, y_tiled)
-        loss_adv_y = -self._cross_entropy(logprob_y, average_batch=True)  # scalar
+        logprob_y = self.q_y_given_z.log_prob(decoder_y_out, y)
+        loss_adv_y_full = logprob_y.mean(dim=(0,1))  # Average over batch and over z_samples
+        loss_adv_y = loss_adv_y_full.mean()  # It is positive cause it is the opposite of a cross-entropy, for the adversarial training
 
         # ---- Blackwell constraint loss ------------------------------- #
-        x_tiled = self._tile_batch(x, num_z_samples)
         decoder_x_out = self.q_x_given_z(z)
-        logprob_x = self.q_x_given_z.log_prob(decoder_x_out, x_tiled)     # (…[, num_x_vars])
-
-        if logprob_x.dim() == 1:
-            logprob_x = logprob_x.unsqueeze(-1)               # ensure last dim = num_x_vars
-
-        num_x_vars = logprob_x.size(-1)
-        batch_size = x.size(0)
-
-        # reshape ➜ (num_z_samples, batch_size, num_x_vars)
-        logprob_x = logprob_x.view(num_z_samples, batch_size, num_x_vars)
-
-        # average over Z-samples:  log₂( 1/N Σ p )
-        avg_logprob_x = (
-            torch.logsumexp(logprob_x * self._LOG2, dim=0) - math.log(num_z_samples)
-        ) / self._LOG2                                            # (batch_size, num_x_vars)
-
-        loss_constraint_vec = self._cross_entropy(
-            avg_logprob_x, average_batch=False
-        ).mean(axis=0)                                             # (num_x_vars, )
-        loss_constraint = loss_constraint_vec.mean()               # scalar
-
+        logprob_x = self.q_x_given_z.log_prob(decoder_x_out, x)     
+        logprob_x_samples_avg = torch.logsumexp(logprob_x * self._LOG2, dim=1) / self._LOG2 - self._LOG2SAMPLES
+        
+        loss_x_full = -logprob_x_samples_avg.mean(dim=0)  # Average over batch
+        loss_x = loss_x_full.mean()
+    
         # ---- total generator objective ------------------------------ #
-        total_loss = beta * loss_constraint + alpha * loss_adv_y
+        total_loss = beta * loss_x + alpha * loss_adv_y
         total_loss.backward()
         self.gen_opt.step()
 
         return {
-            "loss_adv_y": -loss_adv_y.item(),  # reported as positive
-            "loss_constraint_x": loss_constraint_vec.detach().cpu().numpy(),
+            "loss_adv_y": -loss_adv_y_full.detach().cpu().numpy(),  # reported as positive
+            "loss_constraint_x": loss_x_full.detach().cpu().numpy(),
         }
 
     # ------------------------------------------------------------------ #
     def discriminator_step(
         self,
-        y: Tensor,
-        *,
-        num_z_samples: int = 1,
+        y: Tensor
     ) -> Dict[str, float]:
         """One update of the **discriminator** (adversary head)."""
         self.disc_opt.zero_grad()
 
-        y_tiled = self._tile_batch(y, num_z_samples)
-        z = self.q_z_given_y(y_tiled)
+        # Ci sono num_z_samples anche se non servirebbero per simmetria con il generator step
+        # In questo modo, usando lo stesso numero di sample, sono sicuro di avere loss comparabili
+        z = self.q_z_given_y(y, num_samples=self.num_z_samples)  
 
         decoder_y_out = self.q_y_given_z(z)
-        logprob_y = self.q_y_given_z.log_prob(decoder_y_out, y_tiled)
-        loss_y = self._cross_entropy(logprob_y, average_batch=True)
-        loss_y.backward()
+        logprob_y = self.q_y_given_z.log_prob(decoder_y_out, y)
+        loss_adv_y_full = -logprob_y.mean(dim=(0,1)) 
+        loss_adv_y = loss_adv_y_full.mean() 
+
+        loss_adv_y.backward()
         self.disc_opt.step()
 
-        return {"loss_y": loss_y.item()}
+        return {"loss_y": loss_adv_y_full.detach().cpu().numpy()}
+
 
     # ================================================================== #
-    #                            inference                               #
+    #                             inference                              #
     # ================================================================== #
-    @torch.no_grad()
     def forward(
-        self, x: Tensor, y: Tensor, *, num_z_samples: int = 1
+        self,
+        x: Tensor,
+        y: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Fast inference pass.
+        Quick inference.
 
         Returns
         -------
-        z : Tensor
-            Latent samples of shape ``(num_z_samples·batch_size, …)``.
-        logprob_y : Tensor
-            Log-probabilities **log₂ q(Y | Z)** for each latent sample.
-        decoder_x_out : Any
-            Raw decoder output for **q(X | Z)** (can be passed to
-            ``q_x_given_z.log_prob()`` externally).
+        z               : Tensor
+            Latent samples of shape ``(B, N, …)``, where
+            ``N = self.num_z_samples``.
+        logprob_y       : Tensor
+            Log₂ q(Y | Z) for **each** latent sample – shape ``(B, N, …)``.
+        avg_logprob_x   : Tensor
+            Log₂ q(X | Z) averaged over the N samples – shape ``(B, …)``.
         """
-        x_tiled = self._tile_batch(x, num_z_samples)
-        y_tiled = self._tile_batch(y, num_z_samples)
-        z = self.q_z_given_y(y_tiled)
+        z = self.q_z_given_y(y, num_samples=self.num_z_samples)          # (B,N,…)
 
-        decoder_y_out = self.q_y_given_z(z)
-        logprob_y = self.q_y_given_z.log_prob(decoder_y_out, y_tiled)
-
-        decoder_x_out = self.q_x_given_z(z)
-        logprob_x = self.q_x_given_z.log_prob(decoder_x_out, x_tiled)    
-        num_x_vars = logprob_x.size(-1)
-        batch_size = x.size(0)
-        logprob_x = logprob_x.view(num_z_samples, batch_size, num_x_vars)
+        dec_y_out = self.q_y_given_z(z)
+        logprob_y = self.q_y_given_z.log_prob(dec_y_out, y)             # (B,N,…)
+        dec_x_out = self.q_x_given_z(z)
+        logprob_x = self.q_x_given_z.log_prob(dec_x_out, x)             # (B,N,…)
         avg_logprob_x = (
-            torch.logsumexp(logprob_x * self._LOG2, dim=0) - math.log(num_z_samples)
-        ) / self._LOG2
+            torch.logsumexp(logprob_x * self._LOG2, dim=1) / self._LOG2
+            - self._LOG2SAMPLES
+        )                                                               # (B,…)
 
+        logprob_y = logprob_y.mean(dim=(0,1)) 
+        avg_logprob_x = avg_logprob_x.mean(dim=0)
         return z, logprob_y, avg_logprob_x

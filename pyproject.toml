@@ -23,4 +23,5 @@ dev = [
     "scipy",
     "scikit-learn",
     "mkdocs-material",
+    "torch-summary",
 ]

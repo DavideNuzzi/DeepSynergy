@@ -7,7 +7,7 @@ Neural framework for estimating *union information* and synergy.
 Quick start
 -----------
 >>> import torch
->>> from deepsynergy import DeepSynergy, decoders, layers
+>>> from deepsynergy import DeepSynergy, decoders
 >>>
 >>> # --- encoder ---------------------------------------------------
 >>> # mean & log-variance from Y  →  latent Z (Gaussian re-parameterisation)
@@ -41,9 +41,10 @@ from .utils_training import (
     train_deepsynergy_model,
     relax_deepsynergy_model,
     train_decoder,
+    evaluate_deepsynergy_entropy,
     ParameterScheduler,
 )
-from . import decoders, layers  # sub-modules re-exported for convenience
+from . import decoders, encoders  # sub-modules re-exported for convenience
 
 __all__ = [
     # core
@@ -52,12 +53,13 @@ __all__ = [
     "train_deepsynergy_model",
     "relax_deepsynergy_model",
     "train_decoder",
+    "evaluate_deepsynergy_entropy",
     "ParameterScheduler",
     # optimiser helper
     "build_optimizers",
     # sub-modules
     "decoders",
-    "layers",
+    "encoders",
 ]
 
 # optional semantic version

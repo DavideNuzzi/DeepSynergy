@@ -71,49 +71,55 @@ class BinaryDecoder(BaseDecoder):
         return self.core(z)
 
     def log_prob(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loglik_nat = -F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        return loglik_nat / _LN2
 
+        if logits.dim() != target.dim():        # When used with multiple samples (inside DeepSynergy model)
+            target = target.unsqueeze(1)     
 
+        # Numerically stable implementation of the binary cross entropy
+        max_val = torch.clamp(logits, min=0)
+        log_likelihood = -(max_val - logits * target + torch.log1p(torch.exp(-torch.abs(logits))))
+
+        return log_likelihood / _LN2
+
+# ------------------------------------------------------------------ #
 class CategoricalDecoder(BaseDecoder):
     """
-    Categorical likelihood for $V$ variables, each with $C$ classes.
+    Categorical likelihood for `output_dim` variables, each with `num_classes`.
 
-    Parameters
-    ----------
-    core        : nn.Module
-        Deterministic feature extractor $Z \\to$ hidden.
-    num_vars    : int
-        Number of categorical variables $V$.
-    num_classes : int
-        Number of classes per variable $C$.
-
-    Output shapes
-    -------------
-    forward(z)          ➜ (B, V, C)    logits
-    log_prob(params, x) ➜ (B, V)       log₂ likelihood
+        forward(z)          → logits        (B, output_dim, C)
+        log_prob(logits,x)  → log₂-likes    (B, output_dim)
     """
 
-    def __init__(self, core: nn.Module, num_classes: int, num_vars: int = 1):
+    def __init__(self, core: nn.Module, *, num_classes: int, output_dim: int = 1):
         super().__init__(core)
-        self.num_vars = num_vars
-        self.num_classes = num_classes
-        self.logits = nn.LazyLinear(num_vars * num_classes)
+        self.num_vars   = output_dim
+        self.num_cls    = num_classes
+        self.logit_head = nn.LazyLinear(self.num_vars * self.num_cls)
 
+    # ────────────────────────────────────────────────────────────── #
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        logits = self.logits(self.core(z))
-        return logits.view(-1, self.num_vars, self.num_classes)
+        logits = self.logit_head(self.core(z))                # (B,V*C)
+        return logits.view(z.size(0), self.num_vars, self.num_cls)
 
+    # ────────────────────────────────────────────────────────────── #
     def log_prob(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if target.dim() == logits.dim():               # one-hot → indices
+        # one-hot → indices
+        if target.dim() == logits.dim():
             target = target.argmax(dim=-1)
 
+        # Broadcast when an extra latent-sample axis exists
+        if logits.dim() == target.dim() + 1:
+            target = target.unsqueeze(1)                      # expands on decode
+
         B, V, C = logits.shape
-        loglik_nat = -F.cross_entropy(
-            logits.view(B * V, C), target.view(-1).long(), reduction="none"
+        flat_logits  = logits.reshape(B * V, C)
+        flat_target  = target.reshape(-1).long()
+
+        log_likelihood = -F.cross_entropy(
+            flat_logits, flat_target, reduction="none"
         ).view(B, V)
 
-        return loglik_nat / _LN2
+        return log_likelihood / _LN2
 
 
 class GaussianDecoder(BaseDecoder):
@@ -134,6 +140,7 @@ class GaussianDecoder(BaseDecoder):
     """
 
     def __init__(self, core: nn.Module, output_dim: int):
+        
         super().__init__(core)
         self.mu     = nn.LazyLinear(output_dim)
         self.logvar = nn.LazyLinear(output_dim)
@@ -142,73 +149,67 @@ class GaussianDecoder(BaseDecoder):
         h = self.core(z)
         return self.mu(h), self.logvar(h)
 
+
     def log_prob(
         self,
         params: Tuple[torch.Tensor, torch.Tensor],
         target: torch.Tensor,
     ) -> torch.Tensor:
-        mu, lv = params
-        loglik_nat = -0.5 * ((target - mu) ** 2 / lv.exp() + lv + _LN2PI)
-        return loglik_nat / _LN2
+        
+        mu, logvar = params
+        
+        logvar = logvar.clamp(min=-3, max=3) # Clamp to avoid overflow and underflow
+        
+        if mu.dim() != target.dim():        # When used with multiple samples (inside DeepSynergy model)
+            target = target.unsqueeze(1)                      # (batch_size,1,output_dim)
+
+        log_likelihood = -0.5 * ((target - mu) ** 2 / logvar.exp() + logvar + _LN2PI)
+        return log_likelihood / _LN2
 
 
+
+# ------------------------------------------------------------------ #
 class GaussianMixtureDecoder(BaseDecoder):
     """
-    Gaussian-mixture likelihood (diagonal components).
-
-    Parameters
-    ----------
-    core          : nn.Module
-        Deterministic feature extractor.
-    output_dim    : int
-        Number of continuous variables $V$.
-    num_components: int, default 1
-        Number of mixture components $K$.
-        `num_components = 1` reduces to a single Gaussian.
-
-    Output shapes
-    -------------
-    forward(z)
-        • K = 1 : `(mu, logvar)` each (B, V)  
-        • K > 1 : `(mu, logvar, pi_logits)`  
-                  mu/logvar (B, K, V), pi_logits (B, K)
-
-    log_prob(params, x) ➜ (B, V) if K = 1, else (B,)  (see code)
+    Diagonal Gaussian-mixture (K components) for `output_dim` real variables.
+    `num_components=1` reduces to a single Gaussian.
     """
 
-    def __init__(self, core: nn.Module, output_dim: int, num_components: int = 1):
+    def __init__(self, core: nn.Module, *, output_dim: int, num_components: int = 1):
         super().__init__(core)
-        self.num_components = num_components
-        self.output_dim = output_dim
 
-        self.mu     = nn.LazyLinear(num_components * output_dim)
-        self.logvar = nn.LazyLinear(num_components * output_dim)
-        self.pi_logits = nn.LazyLinear(num_components) if num_components > 1 else None
+        self.K = num_components
 
+        self.mu_head     = nn.LazyLinear(self.K * output_dim)
+        self.logvar_head = nn.LazyLinear(self.K * output_dim)
+        self.pi_head     = nn.LazyLinear(self.K)
+
+    # ────────────────────────────────────────────────────────────── #
     def forward(self, z: torch.Tensor):
-        h = self.core(z)
-        mu = self.mu(h).view(-1, self.num_components, self.output_dim)
-        lv = self.logvar(h).view(-1, self.num_components, self.output_dim)
+        h           = self.core(z)
+        mu          = self.mu_head(h)
+        logvar      = self.logvar_head(h)
+        pi_logits   = self.pi_head(h)                                       # (B, ..., K) 
 
-        if self.num_components == 1:
-            return mu.squeeze(1), lv.squeeze(1)
+        mu          = mu.view(*mu.shape[:-1], -1, self.K)      # (B, ..., output_dim, K)
+        logvar      = logvar.view(*logvar.shape[:-1], -1, self.K)
+        pi_logits   = pi_logits.view(*pi_logits.shape[:-1], 1, self.K)  # (B, ..., 1, K)
+        return mu, logvar, pi_logits                       
 
-        return mu, lv, self.pi_logits(h)
-
+    # ────────────────────────────────────────────────────────────── #
     def log_prob(self, params, target: torch.Tensor) -> torch.Tensor:
-        if self.num_components == 1:
-            mu, lv = params
-            loglik_nat = -0.5 * ((target - mu) ** 2 / lv.exp() + lv + _LN2PI)
-            return loglik_nat / _LN2
+        
+        mu, logvar, pi_logits = params                          
+        logvar = logvar.clamp(-3, 3)
 
-        mu, lv, pi_logits = params
-        target = target.unsqueeze(1)                      # (B,1,V)
-        comp_log_nat = -0.5 * ((target - mu) ** 2 / lv.exp() + lv + _LN2PI)
-        # comp_log_nat = comp_log_nat.sum(dim=-1)           # (B,K)
-        # log_pi = torch.log_softmax(pi_logits, dim=1)
-        # mix_log_nat = comp_log_nat + log_pi
+        target = target.unsqueeze(-1) # For the K dimension
+        
+        if target.dim() != mu.dim():        # When used with multiple samples (inside DeepSynergy model)
+            target = target.unsqueeze(1)        # (batch_size,1,...,output_dim,1)
+        
+        comp_log_like = -0.5 * ((target - mu) ** 2 / logvar.exp() + logvar + _LN2PI)
+        log_pi         = torch.log_softmax(pi_logits, dim=-1)
+        mix_log_like   = comp_log_like + log_pi             
+        log_likelihood = torch.logsumexp(mix_log_like, dim=-1) 
 
-        log_pi = torch.log_softmax(pi_logits, dim=1).unsqueeze(-1)   # (B,K,1)
-        mix_log_nat = comp_log_nat + log_pi                          # (B,K,V)
-        loglik_nat = torch.logsumexp(mix_log_nat, dim=1)             # (B,V)
-        return loglik_nat / _LN2                                     # (B,V)
+        return log_likelihood / _LN2
