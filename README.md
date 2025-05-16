@@ -1,6 +1,6 @@
 # DeepSynergy
 
-DeepSynergy is a PyTorch-based framework for estimating *union information* and high-order *synergy* in multivariate systems. It provides a modular implementation of a neural estimator that computes the synergy between multiple source variables \(X_1, \dots, X_n\) and a target \(Y\), using adversarial training to enforce conditional independence constraints.
+DeepSynergy is a PyTorch-based framework for estimating *union information* and high-order *synergy* in multivariate systems. It provides a modular implementation of a neural estimator that computes the synergy between multiple source variables $(X_1, \dots, X_n)$ and a target $Y$, using adversarial training to enforce conditional independence constraints.
 
 ---
 
